@@ -27,6 +27,7 @@ class XUIClient:
         self.verify_ssl = verify_ssl
         self.session = requests.Session()
         self._authenticated = False
+        self._csrf_token = None
 
     def _make_request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
         """
@@ -45,6 +46,12 @@ class XUIClient:
         """
         url = f"{self.base_url}{endpoint}"
         kwargs.setdefault('verify', self.verify_ssl)
+
+        # Add CSRF token to POST/PUT/DELETE requests (v3.0.0+)
+        if method.upper() in ('POST', 'PUT', 'DELETE') and self._csrf_token:
+            if 'headers' not in kwargs:
+                kwargs['headers'] = {}
+            kwargs['headers']['X-CSRF-Token'] = self._csrf_token
 
         try:
             response = self.session.request(method, url, **kwargs)
@@ -98,6 +105,8 @@ class XUIClient:
         try:
             # Try to get CSRF token (v3.0.0+)
             csrf_token = self._get_csrf_token()
+            if csrf_token:
+                self._csrf_token = csrf_token
 
             # Prepare login data
             login_data = {
