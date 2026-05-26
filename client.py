@@ -70,9 +70,24 @@ class XUIClient:
         except requests.RequestException as e:
             raise APIError(f"Request failed: {str(e)}")
 
+    def _get_csrf_token(self) -> Optional[str]:
+        """
+        Get CSRF token (required for v3.0.0+)
+
+        Returns:
+            CSRF token string or None if not supported
+        """
+        try:
+            response = self._make_request('GET', '/csrf-token')
+            return response.get('obj') or response.get('csrfToken')
+        except (APIError, NotFoundError):
+            # Old version without CSRF support
+            return None
+
     def login(self) -> bool:
         """
         Authenticate with the 3x-ui panel
+        Supports both old versions (without CSRF) and new versions (v3.0.0+ with CSRF)
 
         Returns:
             True if authentication successful
@@ -81,13 +96,26 @@ class XUIClient:
             AuthenticationError: If authentication fails
         """
         try:
+            # Try to get CSRF token (v3.0.0+)
+            csrf_token = self._get_csrf_token()
+
+            # Prepare login data
+            login_data = {
+                'username': self.username,
+                'password': self.password
+            }
+
+            # Prepare headers
+            headers = {'Content-Type': 'application/json'}
+            if csrf_token:
+                headers['X-CSRF-Token'] = csrf_token
+
+            # Attempt login
             response = self._make_request(
                 'POST',
                 '/login',
-                data={
-                    'username': self.username,
-                    'password': self.password
-                }
+                json=login_data,
+                headers=headers
             )
 
             if response.get('success'):
@@ -97,6 +125,21 @@ class XUIClient:
                 raise AuthenticationError("Login failed: Invalid credentials")
 
         except APIError as e:
+            # If 403 and we didn't use CSRF, it might be old form-data format
+            if e.status_code == 403 and not csrf_token:
+                try:
+                    # Retry with form data (old API format)
+                    response = self._make_request(
+                        'POST',
+                        '/login',
+                        data=login_data
+                    )
+                    if response.get('success'):
+                        self._authenticated = True
+                        return True
+                except:
+                    pass
+
             raise AuthenticationError(f"Login failed: {str(e)}")
 
     def _ensure_authenticated(self):
