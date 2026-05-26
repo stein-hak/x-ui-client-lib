@@ -299,6 +299,76 @@ class XUIClient:
 
     # ========== Batch Client Operations (High Performance) ==========
 
+    def batch_delete_clients_from_inbound(
+        self,
+        inbound_id: int,
+        emails: List[str]
+    ) -> Tuple[bool, int]:
+        """
+        Delete multiple clients from an inbound in a single request (batch operation).
+
+        This is MUCH faster than calling delete_client() for each client sequentially.
+        Uses update inbound operation to remove clients in one atomic transaction.
+
+        Args:
+            inbound_id: ID of the inbound to delete clients from
+            emails: List of client emails to delete
+
+        Returns:
+            Tuple of (success: bool, deleted_count: int)
+
+        Raises:
+            NotFoundError: If inbound not found
+            APIError: If API request fails
+        """
+        self._ensure_authenticated()
+
+        if not emails:
+            return True, 0
+
+        # Get current inbound configuration
+        inbound = self.get_inbound(inbound_id)
+
+        # Parse current settings (handle both str and dict for v2.x and v3.x compatibility)
+        settings_raw = inbound.get('settings', '{}')
+        settings = json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
+        clients_list = settings.get('clients', [])
+
+        # Filter out clients to delete
+        emails_to_delete = set(emails)
+        original_count = len(clients_list)
+        filtered_clients = [c for c in clients_list if c.get('email') not in emails_to_delete]
+        deleted_count = original_count - len(filtered_clients)
+
+        if deleted_count == 0:
+            # No clients found to delete
+            return True, 0
+
+        # Update settings with filtered clients
+        settings['clients'] = filtered_clients
+
+        # Build update payload (same as batch_add_clients_to_inbound)
+        update_data = {
+            "up": inbound["up"],
+            "down": inbound["down"],
+            "total": inbound["total"],
+            "remark": inbound["remark"],
+            "enable": inbound["enable"],
+            "expiryTime": inbound["expiryTime"],
+            "listen": inbound.get("listen", ""),
+            "port": inbound["port"],
+            "protocol": inbound["protocol"],
+            "settings": json.dumps(settings),
+            "streamSettings": inbound["streamSettings"],
+            "sniffing": inbound["sniffing"]
+        }
+
+        # Update inbound
+        response = self._make_request('POST', f'/panel/api/inbounds/update/{inbound_id}', json=update_data)
+        success = response.get('success', False)
+
+        return success, deleted_count if success else 0
+
     def batch_add_clients_to_inbound(
         self,
         inbound_id: int,
@@ -356,8 +426,9 @@ class XUIClient:
         if not inbound:
             raise NotFoundError(f"Inbound {inbound_id} not found")
 
-        # Parse existing settings
-        settings = json.loads(inbound.get("settings", "{}"))
+        # Parse existing settings (handle both str and dict for v2.x and v3.x compatibility)
+        settings_raw = inbound.get("settings", "{}")
+        settings = json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
         existing_clients = settings.get("clients", [])
 
         # Merge or replace
@@ -442,6 +513,61 @@ class XUIClient:
                     inbound_id,
                     inbound_clients,
                     merge_with_existing=True
+                )
+                results[inbound_id] = (success, count)
+            except Exception as e:
+                results[inbound_id] = (False, 0)
+
+        return results
+
+    def batch_delete_client_from_all_vless_inbounds(
+        self,
+        base_email: str,
+        email_suffix_template: str = "_{inbound_id}"
+    ) -> Dict[int, Tuple[bool, int]]:
+        """
+        Delete a client from ALL VLESS inbounds on this node in batch mode.
+
+        Useful for removing a user completely from a node.
+        Each inbound is updated in a single request.
+
+        Args:
+            base_email: Base email of the client (without suffix)
+            email_suffix_template: Template used when adding (to reconstruct full emails).
+                                  Use {inbound_id} as placeholder. Default: "_{inbound_id}"
+
+        Returns:
+            Dictionary mapping inbound_id -> (success, num_clients_deleted)
+
+        Example:
+            ```python
+            # Delete user@example.com from all VLESS inbounds
+            results = client.batch_delete_client_from_all_vless_inbounds("user@example.com")
+
+            for inbound_id, (success, count) in results.items():
+                print(f"Inbound {inbound_id}: {'✓' if success else '✗'} ({count} clients deleted)")
+            ```
+        """
+        self._ensure_authenticated()
+
+        # Get all VLESS inbounds
+        all_inbounds = self.get_inbounds()
+        vless_inbounds = [ib for ib in all_inbounds if ib.get("protocol") == "vless"]
+
+        results = {}
+
+        for inbound in vless_inbounds:
+            inbound_id = inbound["id"]
+
+            # Reconstruct email for this inbound
+            suffix = email_suffix_template.format(inbound_id=inbound_id)
+            full_email = f"{base_email}{suffix}"
+
+            # Delete using batch operation
+            try:
+                success, count = self.batch_delete_clients_from_inbound(
+                    inbound_id,
+                    [full_email]
                 )
                 results[inbound_id] = (success, count)
             except Exception as e:
