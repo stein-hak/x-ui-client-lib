@@ -455,7 +455,8 @@ class XUIClient:
     def batch_sync_clients_to_all_vless_inbounds(
         self,
         clients: List[Dict[str, Any]],
-        email_suffix_template: str = "_{inbound_id}"
+        email_suffix_template: str = "_{inbound_id}",
+        reality_only: bool = None
     ) -> Dict[int, Tuple[bool, int]]:
         """
         Sync clients to ALL VLESS inbounds on this node in batch mode.
@@ -467,6 +468,8 @@ class XUIClient:
             clients: List of client configurations (see batch_add_clients_to_inbound)
             email_suffix_template: Template for making emails unique per inbound.
                                   Use {inbound_id} as placeholder. Default: "_{inbound_id}"
+            reality_only: If True, only sync to Reality inbounds. If False, only sync to non-Reality inbounds.
+                         If None (default), sync to all VLESS inbounds.
 
         Returns:
             Dictionary mapping inbound_id -> (success, num_clients_added)
@@ -485,6 +488,27 @@ class XUIClient:
         # Get all VLESS inbounds
         all_inbounds = self.get_inbounds()
         vless_inbounds = [ib for ib in all_inbounds if ib.get("protocol") == "vless"]
+
+        # Filter by Reality if needed
+        if reality_only is not None:
+            filtered_inbounds = []
+            for inbound in vless_inbounds:
+                try:
+                    stream_settings_raw = inbound.get("streamSettings", "{}")
+                    stream_settings = json.loads(stream_settings_raw) if isinstance(stream_settings_raw, str) else stream_settings_raw
+                    is_reality = stream_settings.get("security") == "reality"
+
+                    # Include if matches filter
+                    if reality_only and is_reality:
+                        filtered_inbounds.append(inbound)
+                    elif not reality_only and not is_reality:
+                        filtered_inbounds.append(inbound)
+                except:
+                    # If can't parse, treat as non-Reality
+                    if not reality_only:
+                        filtered_inbounds.append(inbound)
+
+            vless_inbounds = filtered_inbounds
 
         results = {}
 
@@ -574,6 +598,231 @@ class XUIClient:
                 results[inbound_id] = (False, 0)
 
         return results
+
+    def batch_delete_all_clients_from_inbound(self, inbound_id: int) -> Tuple[bool, int]:
+        """
+        Delete ALL clients from an inbound (nuclear option).
+
+        Args:
+            inbound_id: ID of the inbound to clear
+
+        Returns:
+            Tuple of (success, num_deleted)
+
+        Example:
+            ```python
+            success, count = client.batch_delete_all_clients_from_inbound(inbound_id=1)
+            print(f"Deleted {count} clients")
+            ```
+        """
+        self._ensure_authenticated()
+
+        try:
+            # Get current inbound
+            inbound = self.get_inbound(inbound_id)
+
+            # Parse settings
+            settings_raw = inbound.get('settings', '{}')
+            settings = json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
+            clients_list = settings.get('clients', [])
+
+            num_clients = len(clients_list)
+
+            if num_clients == 0:
+                return True, 0
+
+            # Clear clients list
+            settings['clients'] = []
+
+            # Update inbound
+            update_data = {
+                "up": inbound["up"],
+                "down": inbound["down"],
+                "total": inbound["total"],
+                "remark": inbound["remark"],
+                "enable": inbound["enable"],
+                "expiryTime": inbound["expiryTime"],
+                "listen": inbound.get("listen", ""),
+                "port": inbound["port"],
+                "protocol": inbound["protocol"],
+                "settings": json.dumps(settings),
+                "streamSettings": inbound["streamSettings"],
+                "sniffing": inbound["sniffing"]
+            }
+
+            response = self._make_request('POST', f'/panel/api/inbounds/update/{inbound_id}', json=update_data)
+            success = response.get('success', False)
+
+            return success, num_clients if success else 0
+
+        except Exception:
+            return False, 0
+
+    def reset_all_traffic(self) -> bool:
+        """
+        Reset traffic counters for ALL inbounds on this node.
+
+        This clears up/down traffic statistics but keeps client configurations.
+        Useful for monthly traffic resets.
+
+        Returns:
+            True if successful, False otherwise
+
+        Example:
+            ```python
+            success = client.reset_all_traffic()
+            if success:
+                print("All traffic counters reset")
+            ```
+        """
+        self._ensure_authenticated()
+
+        try:
+            response = self._make_request('POST', '/panel/api/inbounds/resetAllTraffics')
+            return response.get('success', False)
+        except Exception:
+            return False
+
+    def toggle_client(self, client_email: str, enabled: bool) -> Tuple[bool, int]:
+        """
+        Toggle client enable/disable across all inbounds where the client exists.
+
+        Args:
+            client_email: Client email to toggle
+            enabled: True to enable, False to disable
+
+        Returns:
+            Tuple of (success, count_of_inbounds_updated)
+        """
+        self._ensure_authenticated()
+
+        inbounds = self.get_inbounds()
+        updated_count = 0
+
+        for inbound in inbounds:
+            # Parse settings
+            settings_raw = inbound.get('settings', '{}')
+            settings = json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
+            clients_list = settings.get('clients', [])
+
+            # Find client in this inbound
+            client_found = False
+            client_uuid = None
+
+            for client in clients_list:
+                # Check both exact match and -xhttp suffix
+                if client.get('email') == client_email or client.get('email') == f"{client_email}-xhttp":
+                    client['enable'] = enabled
+                    client_uuid = client.get('id')
+                    client_found = True
+                    break
+
+            if not client_found:
+                continue
+
+            # Update client on this inbound
+            try:
+                update_data = {
+                    "id": inbound["id"],
+                    "settings": json.dumps({"clients": [client]})
+                }
+
+                response = self._make_request(
+                    'POST',
+                    f'/panel/api/inbounds/updateClient/{client_uuid}',
+                    json=update_data
+                )
+
+                if response.get('success', False):
+                    updated_count += 1
+            except Exception as e:
+                print(f"Failed to toggle client on inbound {inbound['id']}: {e}")
+                continue
+
+        return (updated_count > 0, updated_count)
+
+    def get_client_ip_limit(self, client_email: str) -> Optional[int]:
+        """
+        Get IP limit for a client (checks first inbound where client exists).
+
+        Args:
+            client_email: Client email
+
+        Returns:
+            IP limit (0 = unlimited), or None if client not found
+        """
+        self._ensure_authenticated()
+
+        inbounds = self.get_inbounds()
+
+        for inbound in inbounds:
+            settings_raw = inbound.get('settings', '{}')
+            settings = json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
+            clients_list = settings.get('clients', [])
+
+            for client in clients_list:
+                if client.get('email') == client_email or client.get('email') == f"{client_email}-xhttp":
+                    return client.get('limitIp', 0)
+
+        return None
+
+    def update_client_ip_limit(self, client_email: str, limit_ip: int) -> Tuple[bool, int]:
+        """
+        Update IP limit for a client across all inbounds where the client exists.
+
+        Args:
+            client_email: Client email
+            limit_ip: IP limit (0 = unlimited)
+
+        Returns:
+            Tuple of (success, count_of_inbounds_updated)
+        """
+        self._ensure_authenticated()
+
+        inbounds = self.get_inbounds()
+        updated_count = 0
+
+        for inbound in inbounds:
+            # Parse settings
+            settings_raw = inbound.get('settings', '{}')
+            settings = json.loads(settings_raw) if isinstance(settings_raw, str) else settings_raw
+            clients_list = settings.get('clients', [])
+
+            # Find client in this inbound
+            client_found = False
+            client_uuid = None
+
+            for client in clients_list:
+                # Check both exact match and -xhttp suffix
+                if client.get('email') == client_email or client.get('email') == f"{client_email}-xhttp":
+                    client['limitIp'] = limit_ip
+                    client_uuid = client.get('id')
+                    client_found = True
+                    break
+
+            if not client_found:
+                continue
+
+            # Update client on this inbound
+            try:
+                update_data = {
+                    "id": inbound["id"],
+                    "settings": json.dumps({"clients": [client]})
+                }
+
+                response = self._make_request(
+                    'POST',
+                    f'/panel/api/inbounds/updateClient/{client_uuid}',
+                    json=update_data
+                )
+
+                if response.get('success', False):
+                    updated_count += 1
+            except Exception as e:
+                print(f"Failed to update IP limit on inbound {inbound['id']}: {e}")
+                continue
+
+        return (updated_count > 0, updated_count)
 
     def import_inbound(self, inbound_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
