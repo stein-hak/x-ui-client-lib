@@ -11,7 +11,7 @@ from .exceptions import AuthenticationError, APIError, NotFoundError
 class XUIClient:
     """Client for interacting with 3x-ui panel API"""
 
-    def __init__(self, base_url: str, username: str, password: str, verify_ssl: bool = True):
+    def __init__(self, base_url: str, username: str, password: str, verify_ssl: bool = True, timeout: int = 15):
         """
         Initialize the 3x-ui API client
 
@@ -20,11 +20,13 @@ class XUIClient:
             username: Admin username
             password: Admin password
             verify_ssl: Whether to verify SSL certificates (default: True)
+            timeout: Request timeout in seconds (default: 15)
         """
         self.base_url = base_url.rstrip('/')
         self.username = username
         self.password = password
         self.verify_ssl = verify_ssl
+        self.timeout = timeout
         self.session = requests.Session()
         self._authenticated = False
         self._csrf_token = None
@@ -46,6 +48,7 @@ class XUIClient:
         """
         url = f"{self.base_url}{endpoint}"
         kwargs.setdefault('verify', self.verify_ssl)
+        kwargs.setdefault('timeout', self.timeout)
 
         # Add CSRF token to POST/PUT/DELETE requests (v3.0.0+)
         if method.upper() in ('POST', 'PUT', 'DELETE') and self._csrf_token:
